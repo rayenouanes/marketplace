@@ -1,8 +1,8 @@
 -- =====================================================================
 -- schema.sql : création des schémas et des tables du Data Warehouse
 -- Responsable : Lydia (personne 3, PostgreSQL & Data Warehouse)
--- Première version : les noms de colonnes de staging.orders sont à
-
+-- Les noms de colonnes de staging.orders sont à confirmer avec Cris.
+-- =====================================================================
 
 
 -- ---------------------------------------------------------------------
@@ -74,3 +74,22 @@ CREATE INDEX IF NOT EXISTS idx_fact_orders_dt ON dwh.fact_orders (dt);
 -- 5. Table de résumé pour Metabase (une ligne par jour)
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS analytics.daily_summary (
+    dt                DATE PRIMARY KEY,
+    total_orders      INTEGER,
+    total_revenue     NUMERIC(14,2),
+    total_commission  NUMERIC(14,2),
+    avg_basket        NUMERIC(10,2)
+);
+
+
+-- ---------------------------------------------------------------------
+-- 6. Remplissage du calendrier (toute l'année 2026)
+-- ---------------------------------------------------------------------
+INSERT INTO dwh.dim_date (dt, year, month, day, day_of_week)
+SELECT d::date,
+       EXTRACT(YEAR   FROM d),
+       EXTRACT(MONTH  FROM d),
+       EXTRACT(DAY    FROM d),
+       EXTRACT(ISODOW FROM d)
+FROM generate_series('2026-01-01'::date, '2026-12-31'::date, '1 day') AS d
+ON CONFLICT (dt) DO NOTHING;
