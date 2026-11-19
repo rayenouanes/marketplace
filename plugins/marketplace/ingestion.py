@@ -1,59 +1,169 @@
-#Les fonctions d’archivage MinIO et de chargement staging
-#Les fonctions pour sauvegarder les JSON dans MinIO et charger les tables
-
 """
-Ce fichier contiendra les fonctions permettant de :
-1. Sauvegarder les données JSON de l'API dans MinIO.
-2. Charger les vendeurs dans PostgreSQL.
-3. Charger les produits dans PostgreSQL.
-4. Charger les commandes dans PostgreSQL.
+Archivage MinIO et chargement PostgreSQL de la Marketplace.
 
-Les appels HTTP sont gérés séparément dans api_hook.py.
+Fonctions disponibles :
+- upload_raw() : archiver une réponse JSON dans MinIO.
+- read_raw() : relire une archive JSON depuis MinIO.
+- load_sellers() : insérer ou mettre à jour les vendeurs.
+- load_products() : insérer ou mettre à jour les produits.
+- load_orders() : remplacer les commandes d'une journée.
+
+Les appels HTTP restent dans api_hook.py.
+
+Connections Airflow nécessaires :
+- minio_s3
+- postgres_dwh
 """
-
 
 import json
 from datetime import date
-# 1. Charger l'outil dans le programme.
-from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from decimal import Decimal, InvalidOperation
 
-# 2. Préparer un Hook utilisant les paramètres de minio_s3.
-hook = S3Hook(aws_conn_id="minio_s3")
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+
+# Paramètres communs aux fonctions.
+MINIO_CONN_ID = "minio_s3"
+POSTGRES_CONN_ID = "postgres_dwh"
+RAW_BUCKET = "data-lake"
+
+ALLOWED_ENTITIES = {
+    "orders",
+    "sellers",
+    "products",
+    "test_orders",
+}
+
+
+def _parse_date(value):
+    """
+    Vérifier une date au format YYYY-MM-DD.
+
+    Retour :
+        Objet Python date.
+
+    Cette fonction ne contacte aucun service.
+    """
+
+    if not isinstance(value, str):
+        raise TypeError("La date doit être une chaîne YYYY-MM-DD.")
+
+    parsed_date = date.fromisoformat(value)
+
+    if parsed_date.isoformat() != value:
+        raise ValueError("La date doit respecter le format YYYY-MM-DD.")
+
+    return parsed_date
+
+
+def _raw_key(entity, requested_date):
+    """
+    Construire le chemin d'un objet MinIO.
+
+    Exemple :
+        raw/orders/dt=2026-04-07/data.json
+    """
+
+    _parse_date(requested_date)
+
+    if entity not in ALLOWED_ENTITIES:
+        raise ValueError(f"Entité non autorisée : {entity}")
+
+    return f"raw/{entity}/dt={requested_date}/data.json"
+
+
+def _validate_records(records, required_fields, entity):
+    """
+    Vérifier la structure d'une liste de données avant son chargement.
+
+    Chaque élément doit être un dictionnaire contenant les champs requis.
+    Les valeurs requises ne doivent pas être None.
+
+    Les champs supplémentaires sont acceptés et seront ignorés par le SQL.
+    """
+
+    if not isinstance(records, list):
+        raise TypeError(
+            f"{entity} : une liste de dictionnaires est attendue."
+        )
+
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise TypeError(
+                f"{entity} : l'élément {index} n'est pas un dictionnaire."
+            )
+
+        missing_fields = [
+            field
+            for field in required_fields
+            if field not in record or record[field] is None
+        ]
+
+        if missing_fields:
+            raise ValueError(
+                f"{entity} : champs absents ou nuls à l'élément "
+                f"{index} : {', '.join(missing_fields)}"
+            )
+
+
+def _execute_transaction(action):
+    """
+    Exécuter une opération SQL dans une transaction.
+
+    Paramètre :
+        action : fonction recevant un curseur PostgreSQL.
+
+    Si toutes les requêtes réussissent :
+        commit() valide les modifications.
+
+    En cas d'erreur :
+        rollback() annule toutes les modifications de la transaction.
+
+    La connexion est toujours fermée à la fin.
+    """
+
+    hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+    connection = hook.get_conn()
+
+    try:
+        connection.autocommit = False
+
+        with connection.cursor() as cursor:
+            result = action(cursor)
+
+        connection.commit()
+        return result
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
+
 
 def upload_raw(entity, requested_date, payload):
     """
-    Archiver des données JSON dans MinIO.
+    Archiver une réponse JSON dans MinIO.
 
     Paramètres :
-        entity : nom des données, par exemple "orders".
-        requested_date : date au format "YYYY-MM-DD".
+        entity : "orders", "sellers", "products" ou "test_orders".
+        requested_date : date de traitement au format YYYY-MM-DD.
         payload : liste ou dictionnaire Python à sauvegarder.
 
     Retour :
-        Chemin de l'objet créé dans MinIO.
+        Adresse logique de l'objet sauvegardé.
+
+    Un rejeu remplace l'objet au même chemin.
     """
 
-    # Vérifier que la date respecte le format attendu.
-    parsed_date = date.fromisoformat(requested_date)
+    object_key = _raw_key(entity, requested_date)
 
-    if parsed_date.isoformat() != requested_date:
-        raise ValueError("La date doit respecter le format YYYY-MM-DD.")
-
-    # Limiter les noms autorisés pour éviter les chemins inattendus.
-    allowed_entities = {"orders", "sellers", "products", "test_orders"}
-
-    if entity not in allowed_entities:
-        raise ValueError(f"Entité non autorisée : {entity}")
-
-    # Les réponses attendues sont des listes ou des objets JSON.
     if not isinstance(payload, (list, dict)):
         raise TypeError("payload doit être une liste ou un dictionnaire.")
 
-    # Définir le bucket et le chemin du fichier.
-    bucket_name = "data-lake"
-    object_key = f"raw/{entity}/dt={requested_date}/data.json"
-
-    # Transformer les données Python en texte JSON.
+    # Préparer le JSON avant de contacter MinIO.
     json_content = json.dumps(
         payload,
         ensure_ascii=False,
@@ -61,82 +171,167 @@ def upload_raw(entity, requested_date, payload):
         allow_nan=False,
     )
 
-    # Utiliser la Connection Airflow déjà vérifiée.
-    hook = S3Hook(aws_conn_id="minio_s3")
+    # Créer le Hook seulement lorsque la fonction est appelée.
+    hook = S3Hook(aws_conn_id=MINIO_CONN_ID)
 
-    # Envoyer le JSON dans MinIO.
-    # Si le fichier existe déjà à ce chemin, il sera remplacé.
     hook.load_string(
         string_data=json_content,
         key=object_key,
-        bucket_name=bucket_name,
+        bucket_name=RAW_BUCKET,
         replace=True,
         encoding="utf-8",
     )
 
-    # Retourner l'emplacement du fichier pour les logs.
-    return f"s3://{bucket_name}/{object_key}"
+    return f"s3://{RAW_BUCKET}/{object_key}"
+
+
+def read_raw(entity, requested_date):
+    """
+    Relire une archive JSON depuis MinIO.
+
+    Paramètres :
+        entity : nom de l'entité archivée.
+        requested_date : date de l'archive au format YYYY-MM-DD.
+
+    Retour :
+        Liste ou dictionnaire Python.
+
+    Cette fonction permet de charger PostgreSQL depuis l'archive,
+    sans rappeler l'API.
+    """
+
+    object_key = _raw_key(entity, requested_date)
+    hook = S3Hook(aws_conn_id=MINIO_CONN_ID)
+
+    json_content = hook.read_key(
+        key=object_key,
+        bucket_name=RAW_BUCKET,
+    )
+
+    payload = json.loads(json_content)
+
+    if not isinstance(payload, (list, dict)):
+        raise ValueError(
+            "L'archive doit contenir une liste ou un objet JSON."
+        )
+
+    return payload
 
 
 def load_sellers(sellers):
     """
-    Charger les vendeurs dans la table dwh.dim_seller.
+    Insérer ou mettre à jour les vendeurs dans dwh.dim_seller.
 
-    Paramètres :
-        sellers (list[dict]) :
-            Liste de vendeurs contenant les champs convenus :
-            seller_id, name, country et joined_date.
+    Champs attendus :
+        seller_id, name, country, joined_date.
 
-    Comportement prévu :
-        - Insérer les vendeurs qui n'existent pas.
-        - Mettre à jour ceux qui existent déjà.
-        - Utiliser seller_id pour identifier chaque vendeur.
+    Retour :
+        Nombre de vendeurs traités.
+
+    Un vendeur existant est mis à jour, pas dupliqué.
     """
 
-    # Étape 1 : vérifier que les vendeurs possèdent les champs attendus.
+    required_fields = (
+        "seller_id",
+        "name",
+        "country",
+        "joined_date",
+    )
 
-    # Étape 2 : préparer les valeurs à transmettre à PostgreSQL.
+    _validate_records(sellers, required_fields, "sellers")
 
-    # Étape 3 : récupérer la connexion PostgreSQL DWH depuis Airflow.
+    # Préparer toutes les lignes avant de modifier PostgreSQL.
+    rows = [
+        (
+            seller["seller_id"],
+            seller["name"],
+            seller["country"],
+            _parse_date(seller["joined_date"]),
+        )
+        for seller in sellers
+    ]
 
-    # Étape 4 : exécuter l'INSERT avec ON CONFLICT (seller_id) DO UPDATE.
+    sql = """
+        INSERT INTO dwh.dim_seller (
+            seller_id,
+            name,
+            country,
+            joined_date
+        )
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (seller_id)
+        DO UPDATE SET
+            name = EXCLUDED.name,
+            country = EXCLUDED.country,
+            joined_date = EXCLUDED.joined_date;
+    """
 
-    # Étape 5 : valider la transaction si tout réussit.
-    # En cas d'erreur, annuler la transaction.
+    def action(cursor):
+        if rows:
+            cursor.executemany(sql, rows)
 
-    raise NotImplementedError("Chargement vendeurs à implémenter")
+        return len(rows)
+
+    return _execute_transaction(action)
 
 
 def load_products(products):
     """
-    Charger les produits dans la table dwh.dim_product.
+    Insérer ou mettre à jour les produits dans dwh.dim_product.
 
-    Paramètres :
-        products (list[dict]) :
-            Liste de produits contenant les champs convenus :
-            product_id, name, category et seller_id.
-
-    Comportement prévu :
-        - Insérer les produits qui n'existent pas.
-        - Mettre à jour ceux qui existent déjà.
-        - Utiliser product_id pour identifier chaque produit.
+    Champs attendus :
+        product_id, name, category, seller_id.
 
     Prérequis :
-        Les vendeurs référencés doivent être chargés avant les produits.
+        Charger les vendeurs avant les produits.
+
+    Retour :
+        Nombre de produits traités.
+
+    Le champ price de l'API n'est pas inséré dans cette dimension.
     """
 
-    # Étape 1 : vérifier que les produits possèdent les champs attendus.
+    required_fields = (
+        "product_id",
+        "name",
+        "category",
+        "seller_id",
+    )
 
-    # Étape 2 : préparer les valeurs à transmettre à PostgreSQL.
+    _validate_records(products, required_fields, "products")
 
-    # Étape 3 : récupérer la connexion PostgreSQL DWH depuis Airflow.
+    rows = [
+        (
+            product["product_id"],
+            product["name"],
+            product["category"],
+            product["seller_id"],
+        )
+        for product in products
+    ]
 
-    # Étape 4 : exécuter l'INSERT avec ON CONFLICT (product_id) DO UPDATE.
+    sql = """
+        INSERT INTO dwh.dim_product (
+            product_id,
+            name,
+            category,
+            seller_id
+        )
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (product_id)
+        DO UPDATE SET
+            name = EXCLUDED.name,
+            category = EXCLUDED.category,
+            seller_id = EXCLUDED.seller_id;
+    """
 
-    # Étape 5 : valider la transaction si tout réussit.
-    # En cas d'erreur, annuler la transaction.
+    def action(cursor):
+        if rows:
+            cursor.executemany(sql, rows)
 
-    raise NotImplementedError("Chargement produits à implémenter")
+        return len(rows)
+
+    return _execute_transaction(action)
 
 
 def load_orders(requested_date, orders):
@@ -144,39 +339,116 @@ def load_orders(requested_date, orders):
     Remplacer les commandes d'une journée dans staging.orders.
 
     Paramètres :
-        requested_date (str) :
-            Date à charger au format "YYYY-MM-DD".
+        requested_date : date à charger au format YYYY-MM-DD.
+        orders : liste des commandes à insérer.
 
-        orders (list[dict]) :
-            Liste de commandes contenant les champs convenus :
-            order_id, dt, seller_id, product_id, quantity et unit_price.
+    Champs attendus :
+        order_id, dt, seller_id, product_id, quantity, unit_price.
 
-    Comportement prévu :
-        - Vérifier les données avant toute suppression.
-        - Supprimer les anciennes commandes de la date demandée.
-        - Insérer les commandes reçues pour cette date.
-        - Effectuer la suppression et les insertions dans une seule
-          transaction.
+    Retour :
+        Nombre de commandes chargées.
 
-    Important :
-        Le total et la commission seront calculés par le SQL de Lydia.
-        loaded_at est rempli automatiquement par PostgreSQL.
+    Sécurité :
+        Toutes les données sont préparées avant la suppression.
+        Le DELETE et les INSERT utilisent la même transaction.
+        Une liste vide est refusée pour éviter un effacement accidentel.
+
+    Le total et la commission sont calculés ensuite par Lydia.
+    loaded_at est rempli automatiquement par PostgreSQL.
     """
 
-    # Étape 1 : vérifier le format de requested_date.
+    target_date = _parse_date(requested_date)
 
-    # Étape 2 : vérifier les champs de chaque commande et s'assurer
-    # que leur date correspond à requested_date.
+    required_fields = (
+        "order_id",
+        "dt",
+        "seller_id",
+        "product_id",
+        "quantity",
+        "unit_price",
+    )
 
-    # Étape 3 : préparer toutes les lignes avant de modifier la base.
+    _validate_records(orders, required_fields, "orders")
 
-    # Étape 4 : récupérer la connexion PostgreSQL DWH depuis Airflow.
+    if not orders:
+        raise ValueError(
+            "Aucune commande reçue : chargement annulé "
+            "pour préserver les données existantes."
+        )
 
-    # Étape 5 : supprimer uniquement les commandes de requested_date.
+    rows = []
+    seen_order_ids = set()
 
-    # Étape 6 : insérer les nouvelles commandes avec des paramètres SQL.
+    # Valider toutes les commandes avant de modifier la base.
+    for order in orders:
+        order_id = order["order_id"]
+        order_date = _parse_date(order["dt"])
 
-    # Étape 7 : valider le DELETE et les INSERT ensemble.
-    # En cas d'erreur, tout annuler pour conserver les anciennes données.
+        if order_date != target_date:
+            raise ValueError(
+                f"La commande {order_id} n'appartient pas "
+                f"au {requested_date}."
+            )
 
-    raise NotImplementedError("Chargement commandes à implémenter")
+        if order_id in seen_order_ids:
+            raise ValueError(
+                f"Identifiant de commande dupliqué : {order_id}"
+            )
+
+        seen_order_ids.add(order_id)
+
+        quantity = order["quantity"]
+
+        if type(quantity) is not int or quantity <= 0:
+            raise ValueError(
+                f"Quantité invalide pour la commande {order_id}."
+            )
+
+        try:
+            unit_price = Decimal(str(order["unit_price"]))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError(
+                f"Prix invalide pour la commande {order_id}."
+            ) from exc
+
+        if not unit_price.is_finite() or unit_price < 0:
+            raise ValueError(
+                f"Prix invalide pour la commande {order_id}."
+            )
+
+        rows.append(
+            (
+                order_id,
+                target_date,
+                order["seller_id"],
+                order["product_id"],
+                quantity,
+                unit_price,
+            )
+        )
+
+    insert_sql = """
+        INSERT INTO staging.orders (
+            order_id,
+            dt,
+            seller_id,
+            product_id,
+            quantity,
+            unit_price
+        )
+        VALUES (%s, %s, %s, %s, %s, %s);
+    """
+
+    def action(cursor):
+        # Ne supprimer que la journée que l'on recharge.
+        cursor.execute(
+            "DELETE FROM staging.orders WHERE dt = %s",
+            (target_date,),
+        )
+
+        # Si une insertion échoue, la suppression sera aussi annulée.
+        cursor.executemany(insert_sql, rows)
+
+        return len(rows)
+
+    return _execute_transaction(action)
