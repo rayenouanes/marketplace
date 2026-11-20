@@ -9,6 +9,7 @@ services:
       - "127.0.0.1:5433:5432"
     volumes:
       - pg-dwh-data:/var/lib/postgresql
+      - ./init-db:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U marketplace -d marketplace"]
       interval: 10s
@@ -22,10 +23,31 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     ports:
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
       - minio-data:/data
+
+  minio-init:
+    image: amazon/aws-cli:latest
+    depends_on:
+      - minio
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until aws --endpoint-url http://minio:9000 s3 ls; do echo "MinIO pas encore pret..."; sleep 2; done
+        aws --endpoint-url http://minio:9000 s3 mb s3://data-lake || echo "Le bucket data-lake existe deja"
+
+  api-marketplace:
+    build: ./api
+    environment:
+      API_TOKEN: formation-token-2026
+    ports:
+      - "127.0.0.1:5000:5000"
 
   metabase:
     image: metabase/metabase:v0.59.6.1
