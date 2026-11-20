@@ -33,7 +33,7 @@ ORDER BY f.dt;
 -- ORDER BY dt;
 
 
--- Q1.3 — Top 5 vendeurs du jour (visualisation : Bar chart / Row chart)
+-- Q1.3 — Top 10 vendeurs du jour (visualisation : Bar chart / Row chart)
 SELECT
     s.name       AS vendeur,
     SUM(f.total) AS ca
@@ -42,4 +42,4 @@ JOIN dwh.dim_seller s ON s.seller_id = f.seller_id
 WHERE f.dt = (SELECT MAX(dt) FROM dwh.fact_orders)
 GROUP BY s.name
 ORDER BY ca DESC
-LIMIT 5;
+LIMIT 10;
