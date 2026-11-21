@@ -134,7 +134,7 @@ marketplace/
 git clone https://github.com/rayenouanes/marketplace.git
 cd marketplace
 copy .env.example .env          # puis remplacer les CHANGE_ME
-docker compose up -d            # les tables sont créées automatiquement (init-db)
+docker compose up -d postgres-dwh minio minio-init api-marketplace metabase            # les tables sont créées automatiquement (init-db)
 ```
 
 Charger des données (ingestion + transformations, jour par jour) :
